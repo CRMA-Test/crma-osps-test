@@ -1,0 +1,3 @@
+# Intentionally minimal .gitignore for testing
+# This is MISSING important security exclusions!
+node_modules/
