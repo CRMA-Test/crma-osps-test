@@ -1,0 +1,161 @@
+name: CRMA assessment
+
+'on':
+  workflow_dispatch:
+    inputs:
+      target_maturity:
+        description: Desired cumulative OSPS maturity level.
+        type: choice
+        options:
+          - '1'
+          - '2'
+          - '3'
+        default: '2'
+      max_cost_usd:
+        description: Best-effort aggregate model-cost ceiling.
+        type: string
+        default: '0.50'
+      max_total_tokens:
+        description: Aggregate model-token ceiling.
+        type: number
+        default: 2000000
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  assess:
+    name: Assess repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    concurrency:
+      group: crma-assessment-${{ github.repository }}
+      cancel-in-progress: false
+    steps:
+      # The checked-out commit and complete Git history define the repository evidence boundary.
+      - name: Check out assessed repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          path: repository
+          persist-credentials: false
+
+      # Fail before pulling or invoking the model when required repository configuration is absent.
+      - name: Validate CRMA configuration
+        shell: bash
+        env:
+          CRMA_IMAGE: ${{ vars.CRMA_IMAGE }}
+          CRMA_LLM_MODEL: ${{ vars.CRMA_LLM_MODEL }}
+          CRMA_LLM_BASE_URL: ${{ vars.CRMA_LLM_BASE_URL }}
+          CRMA_LLM_API_KEY: ${{ secrets.CRMA_LLM_API_KEY }}
+        run: |
+          if [[ ! "$CRMA_IMAGE" =~ ^docker\.io/[a-z0-9._-]+/crma@sha256:[0-9a-f]{64}$ ]]; then
+            echo 'CRMA_IMAGE must be the approved docker.io namespace/crma image pinned by digest.' >&2
+            exit 1
+          fi
+          if [[ -z "$CRMA_LLM_MODEL" || -z "$CRMA_LLM_BASE_URL" || -z "$CRMA_LLM_API_KEY" ]]; then
+            echo 'CRMA_LLM_MODEL, CRMA_LLM_BASE_URL, and CRMA_LLM_API_KEY are required.' >&2
+            exit 1
+          fi
+
+      # Run the immutable CLI with read-only evidence and a separate writable publication mount.
+      - name: Run CRMA
+        id: assess
+        shell: bash
+        env:
+          CRMA_IMAGE: ${{ vars.CRMA_IMAGE }}
+          CRMA_LLM_MODEL: ${{ vars.CRMA_LLM_MODEL }}
+          CRMA_LLM_BASE_URL: ${{ vars.CRMA_LLM_BASE_URL }}
+          CRMA_LLM_API_KEY: ${{ secrets.CRMA_LLM_API_KEY }}
+          CRMA_LLM_REASONING_EFFORT: ${{ vars.CRMA_LLM_REASONING_EFFORT }}
+          CRMA_LOGFIRE: 'off'
+          CRMA_LOG_LEVEL: INFO
+          GITHUB_TOKEN: ${{ secrets.CRMA_GITHUB_EVIDENCE_TOKEN || github.token }}
+        run: |
+          completion_file="$RUNNER_TEMP/crma-completion.json"
+          output_root="$RUNNER_TEMP/crma-runs"
+          mkdir -p "$output_root"
+          docker pull "$CRMA_IMAGE"
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            --mount "type=bind,source=$GITHUB_WORKSPACE/repository,target=$GITHUB_WORKSPACE/repository,readonly" \
+            --mount "type=bind,source=$output_root,target=$output_root" \
+            --env CRMA_LLM_MODEL \
+            --env CRMA_LLM_BASE_URL \
+            --env CRMA_LLM_API_KEY \
+            --env CRMA_LLM_REASONING_EFFORT \
+            --env CRMA_LOGFIRE \
+            --env CRMA_LOG_LEVEL \
+            --env GITHUB_TOKEN \
+            "$CRMA_IMAGE" \
+            assess "$GITHUB_WORKSPACE/repository" \
+            --target-maturity "${{ inputs.target_maturity }}" \
+            --output "$output_root" \
+            --github "$GITHUB_REPOSITORY" \
+            --github-auth auto \
+            --no-human \
+            --max-cost-usd "${{ inputs.max_cost_usd }}" \
+            --max-total-tokens "${{ inputs.max_total_tokens }}" \
+            --output-format json > "$completion_file"
+          jq -e '.status == "published" and .run_id and .result_directory' \
+            "$completion_file" > /dev/null
+          echo "run_id=$(jq -r '.run_id' "$completion_file")" >> "$GITHUB_OUTPUT"
+          echo "result_directory=$(jq -r '.result_directory' "$completion_file")" \
+            >> "$GITHUB_OUTPUT"
+
+      # Upload only the visible immutable success directory, never the private checkpoint tree.
+      - name: Upload complete assessment
+        id: complete_artifact
+        if: ${{ always() && steps.assess.outcome == 'success' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crma-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.assess.outputs.result_directory }}
+          retention-days: 7
+          if-no-files-found: error
+          include-hidden-files: false
+
+      # Failed runs expose safe diagnostics while resumable model state remains runner-local.
+      - name: Upload safe failure diagnostic
+        if: ${{ always() && steps.assess.outcome == 'failure' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: crma-failure-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/crma-runs/*_failed_*/failure.json
+          retention-days: 7
+          if-no-files-found: ignore
+          include-hidden-files: false
+
+      # Present bounded findings inline and link to the complete retained result.
+      - name: Publish job summary
+        if: ${{ always() }}
+        shell: bash
+        env:
+          ASSESSMENT_OUTCOME: ${{ steps.assess.outcome }}
+          RESULT_DIRECTORY: ${{ steps.assess.outputs.result_directory }}
+          ARTIFACT_URL: ${{ steps.complete_artifact.outputs.artifact-url }}
+          CRMA_IMAGE: ${{ vars.CRMA_IMAGE }}
+        run: |
+          if [[ "$ASSESSMENT_OUTCOME" == "success" ]]; then
+            cat "$RESULT_DIRECTORY/summary.md" >> "$GITHUB_STEP_SUMMARY"
+            {
+              printf '\n---\n'
+              printf 'CRMA image: `%s`  \n' "$CRMA_IMAGE"
+            } >> "$GITHUB_STEP_SUMMARY"
+            if [[ -n "$ARTIFACT_URL" ]]; then
+              printf '[Download the complete assessment](%s)\n' "$ARTIFACT_URL" \
+                >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo 'The complete-result upload returned no artifact URL.' \
+                >> "$GITHUB_STEP_SUMMARY"
+            fi
+          else
+            {
+              echo '# CRMA assessment incomplete'
+              echo
+              echo 'CRMA did not publish a complete result, so this job remains failed.'
+              echo 'A safe failure diagnostic was uploaded when initialization completed.'
+              echo 'Private resumable checkpoints are deliberately not uploaded.'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
